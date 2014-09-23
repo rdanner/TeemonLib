@@ -1,5 +1,6 @@
 /*
-  Emon.cpp - Library for openenergymonitor
+  TeemonLib.cpp - heavily modified teensy-specific variant of emonlib:
+  (previouly EmonLib.cpp] - Library for openenergymonitor
   Created by Trystan Lea, April 27 2010
   GNU GPL
   modified to use up to 12 bits ADC resolution (ex. Arduino Due)
@@ -7,7 +8,7 @@
 */
 
 //#include "WProgram.h" un-comment for use on older versions of Arduino IDE
-#include "EmonLib.h"
+#include "TeemonLib.h"
 
 #if defined(ARDUINO) && ARDUINO >= 100
 
@@ -18,6 +19,9 @@
 #include "WProgram.h"
 
 #endif
+
+// to-do, turn NOISEFLOOR into a per-channel configurable
+#define NOISEFLOOR 3.4
 
 //--------------------------------------------------------------------------------------
 // Sets the pins to be used for voltage and current sensors
@@ -35,44 +39,14 @@ void EnergyMonitor::current(int _inPinI, double _ICAL)
    ICAL = _ICAL;
 }
 
-//--------------------------------------------------------------------------------------
-// Sets the pins to be used for voltage and current sensors based on emontx pin map
-//--------------------------------------------------------------------------------------
-void EnergyMonitor::voltageTX(double _VCAL, double _PHASECAL)
-{
-   inPinV = 2;
-   VCAL = _VCAL;
-   PHASECAL = _PHASECAL;
-}
-
-void EnergyMonitor::currentTX(int _channel, double _ICAL)
-{
-   if (_channel == 1) inPinI = 3;
-   if (_channel == 2) inPinI = 0;
-   if (_channel == 3) inPinI = 1;
-   ICAL = _ICAL;
-}
-
-//--------------------------------------------------------------------------------------
-// emon_calc procedure
-// Calculates realPower,apparentPower,powerFactor,Vrms,Irms,kwh increment
-// From a sample window of the mains AC voltage and current.
-// The Sample window length is defined by the number of half wavelengths or crossings we choose to measure.
-//--------------------------------------------------------------------------------------
+// void/placeholder... old "calcVI" did a lot more than calcuale VI! Keep the method as a wrapper or discard?
 void EnergyMonitor::calcVI(int crossings, int timeout)
 {
-   #if defined emonTxV3
-	int SUPPLYVOLTAGE=3300;
-   #else 
-	int SUPPLYVOLTAGE = readVcc();
-   #endif
 
-  int crossCount = 0;                             //Used to measure number of times threshold is crossed.
-  int numberOfSamples = 0;                        //This is now incremented  
+}
 
-  //-------------------------------------------------------------------------------------------------------------------------
-  // 1) Waits for the waveform to be close to 'zero' (500 adc) part in sin curve.
-  //-------------------------------------------------------------------------------------------------------------------------
+void EnergyMonitor::waitForCross(int timeout) 
+{
   boolean st=false;                                  //an indicator to exit the while loop
 
   unsigned long start = millis();    //millis()-start makes sure it doesnt get stuck in the loop if there is an error.
@@ -82,14 +56,38 @@ void EnergyMonitor::calcVI(int crossings, int timeout)
      startV = analogRead(inPinV);                    //using the voltage waveform
      if ((startV < (ADC_COUNTS/2+50)) && (startV > (ADC_COUNTS/2-50))) st=true;  //check its within range
      if ((millis()-start)>timeout) st = true;
-  }
+  } 
+}
+
+//--------------------------------------------------------------------------------------
+// emon_calc procedure
+// Calculates realPower,apparentPower,powerFactor,Vrms,Irms,kwh increment
+// From a sample window of the mains AC voltage and current.
+// The Sample window length is defined by the number of half wavelengths or crossings we choose to measure.
+//--------------------------------------------------------------------------------------
+#define CALC_STATE_PENDING 0
+#define CALC_STATE_COMPLETE  1
+#define CALC_STATE_TIMEDOUT -1
+int EnergyMonitor::calcAllNonblock(int crossings, int timeout, int init)
+{
+
+	int SUPPLYVOLTAGE = readVcc();
+
+  int numberOfSamples = 0;                        //This is now incremented  
+
+  //-------------------------------------------------------------------------------------------------------------------------
+  // 1) Waits for the waveform to be close to 'zero' (500 adc) part in sin curve.
+  //-------------------------------------------------------------------------------------------------------------------------
   
   //-------------------------------------------------------------------------------------------------------------------------
   // 2) Main measurment loop
   //------------------------------------------------------------------------------------------------------------------------- 
-  start = millis(); 
 
-  while ((crossCount < crossings) && ((millis()-start)<timeout)) 
+  if (init) {
+    lastStartMillis = millis(); 
+    crossCount = 0;
+  }
+  if ((crossCount < crossings) && ((millis()-lastStartMillis)<timeout)) 
   {
     numberOfSamples++;                            //Count number of times looped.
 
@@ -145,66 +143,62 @@ void EnergyMonitor::calcVI(int crossings, int timeout)
     if (numberOfSamples==1) lastVCross = checkVCross;                  
                      
     if (lastVCross != checkVCross) crossCount++;
-  }
- 
-  //-------------------------------------------------------------------------------------------------------------------------
-  // 3) Post loop calculations
-  //------------------------------------------------------------------------------------------------------------------------- 
-  //Calculation of the root of the mean of the voltage and current squared (rms)
-  //Calibration coeficients applied. 
-  
-  double V_RATIO = VCAL *((SUPPLYVOLTAGE/1000.0) / (ADC_COUNTS));
-  Vrms = V_RATIO * sqrt(sumV / numberOfSamples); 
-  
-  double I_RATIO = ICAL *((SUPPLYVOLTAGE/1000.0) / (ADC_COUNTS));
-  Irms = I_RATIO * sqrt(sumI / numberOfSamples); 
-
-  //Calculation power values
-  realPower = V_RATIO * I_RATIO * sumP / numberOfSamples;
-  apparentPower = Vrms * Irms;
-  powerFactor=realPower / apparentPower;
-
-  //Reset accumulators
-  sumV = 0;
-  sumI = 0;
-  sumP = 0;
-//--------------------------------------------------------------------------------------       
-}
-
-//--------------------------------------------------------------------------------------
-double EnergyMonitor::calcIrms(int NUMBER_OF_SAMPLES)
-{
-  
-   #if defined emonTxV3
-	int SUPPLYVOLTAGE=3300;
-   #else 
-	int SUPPLYVOLTAGE = readVcc();
-   #endif
-
-  
-  for (int n = 0; n < NUMBER_OF_SAMPLES; n++)
+    
+    return CALC_STATE_PENDING;
+  } 
+  else
   {
-    lastSampleI = sampleI;
-    sampleI = analogRead(inPinI);
-    lastFilteredI = filteredI;
-    filteredI = 0.996*(lastFilteredI+sampleI-lastSampleI);
+    // either we hit the calc timeout or the desired number of crossings. Time to update the
+    // metrics
+  
+    double V_RATIO = VCAL *((SUPPLYVOLTAGE/1000.0) / (ADC_COUNTS));
+    Vrms = V_RATIO * sqrt(sumV / numberOfSamples); 
+    
+    double I_RATIO = ICAL *((SUPPLYVOLTAGE/1000.0) / (ADC_COUNTS));
+    Irms = I_RATIO * sqrt(sumI / numberOfSamples); 
 
-    // Root-mean-square method current
-    // 1) square current values
-    sqI = filteredI * filteredI;
-    // 2) sum 
-    sumI += sqI;
+    //Calculation power values
+    realPower = V_RATIO * I_RATIO * sumP / numberOfSamples;
+    apparentPower = Vrms * Irms;
+    powerFactor=realPower / apparentPower;
+    
+    
+    // handle the wattseconds counter 
+    uint32_t incr, carry;
+    if (filterReadyIn > 0) {
+      // first few times calcVI is called, the offset filter is still not settled and the
+      // counter deltas are worthless. tune the initial value of filterReadyIn to prevent giant inital counter values.
+      filterReadyIn--;
+      wsLastCalcTime = 0;
+      ws = 0;
+    } else {
+      incr = wsLastCalcTime / 1000;
+      if (incr) {
+        carry = wsLastCalcTime % 1000;
+        
+        if (realPower < 20) {
+          // no decrementing supported (for now?). Additionally, anything below 60% of the noise "floor" is ignored.
+          if (realPower > NOISEFLOOR*0.6) {
+            ws += incr*(map((long)(realPower*1000), (NOISEFLOOR*0.6)*1000, 20000, 0, 20000)/1000);
+          }
+        } else {
+          ws += (uint64_t) ((double)incr*realPower);
+        }
+        wsLastCalcTime = carry;
+      }
+    }
+    //Reset accumulators
+    sumV = 0;
+    sumI = 0;
+    sumP = 0;
+    
+    return (crossCount >= crossings) ? CALC_STATE_COMPLETE : CALC_STATE_TIMEDOUT;
+    
   }
-
-  double I_RATIO = ICAL *((SUPPLYVOLTAGE/1000.0) / (ADC_COUNTS));
-  Irms = I_RATIO * sqrt(sumI / NUMBER_OF_SAMPLES); 
-
-  //Reset accumulators
-  sumI = 0;
-//--------------------------------------------------------------------------------------       
  
-  return Irms;
+
 }
+
 
 void EnergyMonitor::serialprint()
 {
@@ -226,34 +220,16 @@ void EnergyMonitor::serialprint()
 
 long EnergyMonitor::readVcc() {
   long result;
-  
-  //not used on emonTx V3 - as Vcc is always 3.3V - eliminates bandgap error and need for calibration http://harizanov.com/2013/09/thoughts-on-avr-adc-accuracy/
 
-  #if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328__) || defined (__AVR_ATmega328P__)
-  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);  
-  #elif defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__) || defined(__AVR_AT90USB1286__)
-  ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
-  ADCSRB &= ~_BV(MUX5);   // Without this the function always returns -1 on the ATmega2560 http://openenergymonitor.org/emon/node/2253#comment-11432
-  #elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
-  ADMUX = _BV(MUX5) | _BV(MUX0);
-  #elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
-  ADMUX = _BV(MUX3) | _BV(MUX2);
-	
-  #endif
-
-
-  #if defined(__AVR__) 
-  delay(2);                                        // Wait for Vref to settle
-  ADCSRA |= _BV(ADSC);                             // Convert
-  while (bit_is_set(ADCSRA,ADSC));
-  result = ADCL;
-  result |= ADCH<<8;
-  result = 1126400L / result;                     //1100mV*1024 ADC steps http://openenergymonitor.org/emon/node/1186
+//check for Teensy3.1 (note, this may work for teensy3.0 as well... if so, check CORE_TEENSY to match teensy 3.X instead)
+#if defined(__MK20DX256__)
+  // analogReadAveraging() with 8 or higher should have been called in the main sketch setup for this to prove most reliable
+  result = 1195 * ADC_COUNTS /analogRead(39);
+  delay(1);
+  result = (result + (1195 * ADC_COUNTS /analogRead(39)))/2;
   return result;
- #elif defined(__arm__)
-  return (3300);                                  //Arduino Due
- #else 
-  return (3300);                                  //Guess that other un-supported architectures will be running a 3.3V!
- #endif
+#endif
+
+  return 3300;
 }
 

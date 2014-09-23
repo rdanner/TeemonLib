@@ -1,13 +1,14 @@
 /*
-  Emon.h - Library for openenergymonitor
+  TeemonLib.h - heavily modified teensy-specific variant of emonlib:
+  [formerly EmonLib.h] - Library for openenergymonitor
   Created by Trystan Lea, April 27 2010
   GNU GPL
   modified to use up to 12 bits ADC resolution (ex. Arduino Due)
   by boredman@boredomprojects.net 26.12.2013
 */
 
-#ifndef EmonLib_h
-#define EmonLib_h
+#ifndef TeemonLib_h
+#define TeemonLib_h
 
 #if defined(ARDUINO) && ARDUINO >= 100
 
@@ -43,6 +44,8 @@ class EnergyMonitor
     void currentTX(int _channel, double _ICAL);
 
     void calcVI(int crossings, int timeout);
+    void waitForCross(int timeout);
+    int calcAllNonblock(int crossings, int timeout, int init);
     double calcIrms(int NUMBER_OF_SAMPLES);
     void serialprint();
 
@@ -53,6 +56,13 @@ class EnergyMonitor
        powerFactor,
        Vrms,
        Irms;
+    uint64_t ws;
+
+    // TO-DO:
+    // Teensy 3.x ADC library (used by T3.1 for parallel reading of the dual DACs)    
+    // http://forum.pjrc.com/threads/25532-ADC-library-update-now-with-support-for-Teensy-3-1
+    // https://github.com/pedvide/ADC
+    // ADC *adc; 
 
   private:
 
@@ -65,11 +75,15 @@ class EnergyMonitor
     double ICAL;
     double PHASECAL;
 
+    int filterReadyIn = 5; // how many calcVI calls until we start the counter(s)
+    elapsedMillis wsLastCalcTime;
+
     //--------------------------------------------------------------------------------------
     // Variable declaration for emon_calc procedure
     //--------------------------------------------------------------------------------------
 	int lastSampleV,sampleV;   //sample_ holds the raw analog read value, lastSample_ holds the last sample
 	int lastSampleI,sampleI;                      
+  unsigned long lastStartMillis;
 
 	double lastFilteredV,filteredV;                   //Filtered_ is the raw analog value minus the DC offset
 	double lastFilteredI, filteredI;                  
